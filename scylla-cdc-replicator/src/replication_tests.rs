@@ -7,7 +7,7 @@ mod tests {
     use scylla::frame::response::result::CqlValue::{Boolean, Int, Text, UserDefinedType};
     use scylla::frame::response::result::{CqlValue, Row};
     use scylla::Session;
-    use scylla_cdc::consumer::{CDCRow, CDCRowSchema, Consumer};
+    use scylla_cdc::consumer::{CDCRow, CDCRowSchema, Consumer, FromCdcRow};
     use scylla_cdc_test_utils::prepare_db;
     use std::sync::Arc;
 

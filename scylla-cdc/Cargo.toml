@@ -30,3 +30,4 @@ rand = "0.8.5"
 scylla-cdc-test-utils = { path = "../scylla-cdc-test-utils" }
 # To compile one of the doc tests, we need rt-multi-thread feature.
 tokio = { version = "1.1.0", features = ["rt", "io-util", "net", "time", "macros", "sync", "rt-multi-thread"] }
+serde_json = { version = "1.0" }

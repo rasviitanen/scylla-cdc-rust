@@ -16,7 +16,7 @@ use tracing::{enabled, warn};
 
 use crate::cdc_types::{GenerationTimestamp, StreamID};
 use crate::checkpoints::{start_saving_checkpoints, CDCCheckpointSaver, Checkpoint};
-use crate::consumer::{CDCRow, CDCRowSchema, Consumer};
+use crate::consumer::{CDCRowSchema, Consumer, ConsumerType, FromCdcRow};
 
 const BASIC_TIMEOUT_SLEEP_MS: u128 = 10;
 const TIMEOUT_FACTOR: u128 = 2;
@@ -95,19 +95,13 @@ impl StreamReader {
         *guard = Some(new_upper_timestamp);
     }
 
-    pub async fn fetch_cdc(
+    pub async fn fetch_cdc<T: ConsumerType>(
         &self,
         keyspace: String,
         table_name: String,
-        mut consumer: Box<dyn Consumer>,
+        mut consumer: Box<dyn Consumer<T>>,
     ) -> anyhow::Result<()> {
-        let query = format!(
-            "SELECT * FROM {}.{}_scylla_cdc_log \
-            WHERE \"cdc$stream_id\" in ? \
-            AND \"cdc$time\" >= minTimeuuid(?) \
-            AND \"cdc$time\" < minTimeuuid(?)  BYPASS CACHE",
-            keyspace, table_name
-        );
+        let query = <T as ConsumerType>::query_string(&keyspace, &table_name);
         let query_base = self.session.prepare_statement(query).await?;
         let mut window_begin = self.config.lower_timestamp;
         let window_size = chrono::Duration::from_std(self.config.window_size)?;
@@ -190,10 +184,10 @@ impl StreamReader {
         Ok(())
     }
 
-    async fn fetch_and_consume_rows(
+    async fn fetch_and_consume_rows<T: ConsumerType>(
         &self,
         query_base: &PreparedStatement,
-        consumer: &mut Box<dyn Consumer>,
+        consumer: &mut Box<dyn Consumer<T>>,
         window_begin: Timestamp,
         window_end: Timestamp,
     ) -> anyhow::Result<()> {
@@ -221,7 +215,13 @@ impl StreamReader {
                         let schema = CDCRowSchema::new(&x.col_specs);
 
                         for row in rows {
-                            consumer.consume_cdc(CDCRow::from_row(row, &schema)).await?;
+                            consumer
+                                .consume_cdc(
+                                    <<T as ConsumerType>::Value<'_> as FromCdcRow>::from_row(
+                                        row, &schema,
+                                    ),
+                                )
+                                .await?;
                         }
                     }
                     match x.paging_state {
@@ -293,6 +293,8 @@ mod tests {
     use std::sync::atomic::AtomicIsize;
     use std::sync::atomic::Ordering::Relaxed;
     use tokio::sync::Mutex;
+
+    use crate::consumer::{CDCRow, Json, JsonRow};
 
     use super::*;
 
@@ -387,6 +389,62 @@ mod tests {
                 data.take_value("v").unwrap().as_text().unwrap().to_string(),
             );
             self.fetched_rows.lock().await.push(new_val);
+            Ok(())
+        }
+    }
+
+    struct FetchTestJsonConsumer {
+        fetched_rows: Arc<Mutex<Vec<TestResult>>>,
+    }
+
+    #[async_trait]
+    impl Consumer<Json> for FetchTestJsonConsumer {
+        async fn consume_cdc(&mut self, data: JsonRow<'_>) -> anyhow::Result<()> {
+            let json = serde_json::from_str::<serde_json::Value>(data.value())?;
+            let new_val = (
+                json.get("pk")
+                    .cloned()
+                    .and_then(|v| {
+                        if let serde_json::Value::Number(v) = v {
+                            v.as_i64().map(|v| v as i32)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap(),
+                json.get("s")
+                    .cloned()
+                    .and_then(|v| {
+                        if let serde_json::Value::String(v) = v {
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap(),
+                json.get("t")
+                    .cloned()
+                    .and_then(|v| {
+                        if let serde_json::Value::Number(v) = v {
+                            v.as_i64().map(|v| v as i32)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap(),
+                json.get("v")
+                    .cloned()
+                    .and_then(|v| {
+                        if let serde_json::Value::String(v) = v {
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap(),
+            );
+            self.fetched_rows.lock().await.push(new_val);
+
             Ok(())
         }
     }
@@ -497,6 +555,38 @@ mod tests {
             .await;
         let fetched_rows = Arc::new(Mutex::new(vec![]));
         let consumer = Box::new(FetchTestConsumer {
+            fetched_rows: Arc::clone(&fetched_rows),
+        });
+
+        cdc_reader
+            .fetch_cdc(ks, TEST_TABLE.to_string(), consumer)
+            .await
+            .unwrap();
+
+        for (count, row) in fetched_rows.lock().await.iter().enumerate() {
+            let (pk, s, t, v) = row.clone();
+            assert_eq!(pk, partition_key as i32);
+            assert_eq!(t, count as i32);
+            assert_eq!(v.to_string(), format!("val{}", count));
+            assert_eq!(s.to_string(), format!("static{}", count));
+        }
+    }
+
+    #[tokio::test]
+    async fn json_check_fetch_cdc_with_one_stream_id() {
+        let (shared_session, ks) = prepare_simple_db().await.unwrap();
+
+        let partition_key = 0;
+        populate_simple_db_with_pk(&shared_session, partition_key)
+            .await
+            .unwrap();
+
+        let cdc_reader = get_test_stream_reader(&shared_session).await.unwrap();
+        cdc_reader
+            .set_upper_timestamp(now() + chrono::Duration::seconds(1))
+            .await;
+        let fetched_rows = Arc::new(Mutex::new(vec![]));
+        let consumer = Box::new(FetchTestJsonConsumer {
             fetched_rows: Arc::clone(&fetched_rows),
         });
 

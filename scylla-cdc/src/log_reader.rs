@@ -26,7 +26,7 @@ use tracing::warn;
 
 use crate::cdc_types::GenerationTimestamp;
 use crate::checkpoints::CDCCheckpointSaver;
-use crate::consumer::ConsumerFactory;
+use crate::consumer::{ConsumerFactory, ConsumerType, Cql};
 use crate::stream_generations::GenerationFetcher;
 use crate::stream_reader::{CDCReaderConfig, StreamReader};
 
@@ -60,18 +60,21 @@ impl CDCLogReader {
     }
 }
 
-struct CDCReaderWorker {
+struct CDCReaderWorker<T = Cql>
+where
+    T: ConsumerType,
+{
     session: Arc<Session>,
     keyspace: String,
     table_name: String,
     end_timestamp: chrono::Duration,
     readers: Vec<Arc<StreamReader>>,
     end_timestamp_receiver: tokio::sync::watch::Receiver<chrono::Duration>,
-    consumer_factory: Arc<dyn ConsumerFactory>,
+    consumer_factory: Arc<dyn ConsumerFactory<T>>,
     config: CDCReaderConfig,
 }
 
-impl CDCReaderWorker {
+impl<T: ConsumerType> CDCReaderWorker<T> {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let fetcher = Arc::new(GenerationFetcher::new(&self.session));
         let (mut generation_receiver, _future_handle) = fetcher
@@ -242,7 +245,53 @@ impl CDCReaderWorker {
 /// # Ok(())
 /// # }
 /// ```
-pub struct CDCLogReaderBuilder {
+///
+/// You can also consume JSON rows instead of [`Cql`], as demonstrated by the example below.
+///
+/// # Example
+///
+/// ```
+/// # use scylla_cdc::log_reader::{CDCLogReader, CDCLogReaderBuilder};
+/// # use scylla_cdc::consumer::{Json, JsonRow, ConsumerFactory, Consumer, CDCRow};
+/// # use futures::future::RemoteHandle;
+/// # use scylla::{Session, SessionBuilder};
+/// # use std::sync::Arc;
+/// # use async_trait::async_trait;
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// struct DummyJsonConsumer;
+///
+/// #[async_trait]
+/// impl Consumer<Json> for DummyJsonConsumer {
+///     async fn consume_cdc(&mut self, data: JsonRow<'_>) -> anyhow::Result<()> {
+///         // ... consume received data ...
+///         Ok(())
+///     }
+/// }
+///
+/// struct DummyJsonConsumerFactory;
+///
+/// #[async_trait]
+/// impl ConsumerFactory<Json> for DummyJsonConsumerFactory {
+///     async fn new_consumer(&self) -> Box<dyn Consumer<Json>> {
+///         Box::new(DummyJsonConsumer)
+///     }
+/// }
+///
+/// let session = SessionBuilder::new().known_node("127.0.0.1:9042").build().await.unwrap();
+/// let (cdc_log_printer, handle): (CDCLogReader, RemoteHandle<anyhow::Result<()>>) = CDCLogReaderBuilder::<Json>::new()
+///     .session(Arc::new(session))
+///     .keyspace("log_reader_ks")
+///     .table_name("log_reader_table")
+///     .consumer_factory(Arc::new(DummyJsonConsumerFactory))
+///     .build()
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct CDCLogReaderBuilder<T = Cql>
+where
+    T: ConsumerType,
+{
     session: Option<Arc<Session>>,
     keyspace: Option<String>,
     table_name: Option<String>,
@@ -251,14 +300,14 @@ pub struct CDCLogReaderBuilder {
     window_size: time::Duration,
     safety_interval: time::Duration,
     sleep_interval: time::Duration,
-    consumer_factory: Option<Arc<dyn ConsumerFactory>>,
+    consumer_factory: Option<Arc<dyn ConsumerFactory<T>>>,
     should_load_progress: bool,
     should_save_progress: bool,
     checkpoint_saver: Option<Arc<dyn CDCCheckpointSaver>>,
     pause_between_saves: time::Duration,
 }
 
-impl CDCLogReaderBuilder {
+impl<C: ConsumerType> CDCLogReaderBuilder<C> {
     /// Creates new CDCLogReaderBuilder with default configuration.
     ///
     /// # Default configuration
@@ -270,7 +319,7 @@ impl CDCLogReaderBuilder {
     /// * should_load_progress: false
     /// * should_save_progress: false,
     /// * pause_between_saves: 10 seconds
-    pub fn new() -> CDCLogReaderBuilder {
+    pub fn new() -> Self {
         let end_timestamp = chrono::Duration::max_value();
         let session = None;
         let keyspace = None;
@@ -374,7 +423,7 @@ impl CDCLogReaderBuilder {
 
     /// Set consumer factory which will be used in the [`CDCLogReader`] instance to create
     /// consumers and feed them with data fetched from the CDC log.
-    pub fn consumer_factory(mut self, consumer_factory: Arc<dyn ConsumerFactory>) -> Self {
+    pub fn consumer_factory(mut self, consumer_factory: Arc<dyn ConsumerFactory<C>>) -> Self {
         self.consumer_factory = Some(consumer_factory);
         self
     }
@@ -486,7 +535,7 @@ impl CDCLogReaderBuilder {
 }
 
 /// Create a [`CDCLogReaderBuilder`] with default configuration, same as [`CDCLogReaderBuilder::new()`]
-impl Default for CDCLogReaderBuilder {
+impl<T: ConsumerType> Default for CDCLogReaderBuilder<T> {
     fn default() -> Self {
         Self::new()
     }

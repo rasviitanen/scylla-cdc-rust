@@ -8,6 +8,69 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
 
+/// Trait used to represent a consumer type.
+/// This allows a reder to consume either [`Cql`] or [`Json`] rows.
+pub trait ConsumerType: 'static + Send + Sync {
+    /// The value that the row will be parsed as.
+    type Value<'a>: Send + FromCdcRow<'a>;
+
+    fn query_string(keyspace: &str, table_name: &str) -> String;
+}
+
+/// Marker for using JSON as the consumer type
+pub struct Json;
+
+impl ConsumerType for Json {
+    type Value<'a> = JsonRow<'a>;
+
+    fn query_string(keyspace: &str, table_name: &str) -> String {
+        format!(
+            "SELECT JSON * FROM {}.{}_scylla_cdc_log \
+            WHERE \"cdc$stream_id\" in ? \
+            AND \"cdc$time\" >= minTimeuuid(?) \
+            AND \"cdc$time\" < minTimeuuid(?)  BYPASS CACHE",
+            keyspace, table_name
+        )
+    }
+}
+
+/// Represents data from a single row in the CDC log in JSON format.
+/// To get more information about the contents of the row, see [the CDC documentation](<https://docs.scylladb.com/using-scylla/cdc/cdc-log-table/>).
+pub struct JsonRow<'a> {
+    value: String,
+    // Used to satisfy lifetime constraints
+    _lt: &'a (),
+}
+
+impl<'a> JsonRow<'a> {
+    /// Borrows the internal JSON value
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Converts the row into the internal JSON value
+    pub fn into_value(self) -> String {
+        self.value
+    }
+}
+
+/// Marker for using Cql as the consumer type
+pub struct Cql;
+
+impl ConsumerType for Cql {
+    type Value<'a> = CDCRow<'a>;
+
+    fn query_string(keyspace: &str, table_name: &str) -> String {
+        format!(
+            "SELECT * FROM {}.{}_scylla_cdc_log \
+            WHERE \"cdc$stream_id\" in ? \
+            AND \"cdc$time\" >= minTimeuuid(?) \
+            AND \"cdc$time\" < minTimeuuid(?)  BYPASS CACHE",
+            keyspace, table_name
+        )
+    }
+}
+
 /// Trait used to represent a user-defined callback
 /// used for processing read CDC rows.
 /// During reading the CDC log, the stream ids are grouped by VNodes.
@@ -17,17 +80,26 @@ use std::fmt::Formatter;
 ///
 /// For more information about the reading algorithms,
 /// please refer to the documentation of [`crate::log_reader`] module.
+///
+/// By default, the consumer will consume CDC rows in the [`Cql`] format.
+/// To switch to JSON, please implement [`Consumer<Json>`] instead.
 #[async_trait]
-pub trait Consumer: Send {
-    async fn consume_cdc(&mut self, data: CDCRow<'_>) -> anyhow::Result<()>;
+pub trait Consumer<T = Cql>: Send
+where
+    T: ConsumerType,
+{
+    async fn consume_cdc(&mut self, data: T::Value<'_>) -> anyhow::Result<()>;
 }
 
 /// Trait used to represent a factory of [`Consumer`] instances.
 /// For rules about creating new consumers,
 /// please refer to the documentation of ['Consumer'].
 #[async_trait]
-pub trait ConsumerFactory: Sync + Send {
-    async fn new_consumer(&self) -> Box<dyn Consumer>;
+pub trait ConsumerFactory<T = Cql>: Sync + Send
+where
+    T: ConsumerType,
+{
+    async fn new_consumer(&self) -> Box<dyn Consumer<T>>;
 }
 
 /// Represents different types of CDC operations.
@@ -71,8 +143,8 @@ const END_OF_BATCH_NAME: &str = "cdc$end_of_batch";
 const OPERATION_NAME: &str = "cdc$operation";
 const TTL_NAME: &str = "cdc$ttl";
 const IS_DELETED_PREFIX: &str = "cdc$deleted_";
-const ARE_ELEMENTS_DELETED_PREFIX: &str = "cdc$deleted_elements_";
 
+const ARE_ELEMENTS_DELETED_PREFIX: &str = "cdc$deleted_elements_";
 /// A structure used to map names of columns in the CDC
 /// to their indices in an internal vector.
 pub struct CDCRowSchema {
@@ -147,6 +219,29 @@ impl CDCRowSchema {
     }
 }
 
+pub trait FromCdcRow<'a> {
+    fn from_row(row: Row, spec: &'a CDCRowSchema) -> Self;
+}
+
+impl<'a> FromCdcRow<'a> for JsonRow<'a> {
+    fn from_row(mut row: Row, _spec: &'a CDCRowSchema) -> Self {
+        JsonRow {
+            value: row
+                .columns
+                .remove(0) // We always get a single column as a response that contains the JSON
+                .and_then(|result| {
+                    if let CqlValue::Text(json) = result {
+                        Some(json)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default(), // Just default to an empty value if we somehow fail (should be unreachable)
+            _lt: &(),
+        }
+    }
+}
+
 /// Represents data from a single row in the CDC log.
 /// The metadata can be accessed directly like any other member variable,
 /// other columns can be accessed by using the struct methods, e.g. [`get_value`].
@@ -166,8 +261,8 @@ pub struct CDCRow<'schema> {
     schema: &'schema CDCRowSchema,
 }
 
-impl CDCRow<'_> {
-    pub fn from_row(row: Row, schema: &CDCRowSchema) -> CDCRow {
+impl<'a> FromCdcRow<'a> for CDCRow<'a> {
+    fn from_row(row: Row, schema: &'a CDCRowSchema) -> CDCRow<'a> {
         // If cdc read was successful, these default values will not be used.
         let mut stream_id_vec = vec![];
         let mut time = uuid::Uuid::default();
@@ -209,7 +304,9 @@ impl CDCRow<'_> {
             schema,
         }
     }
+}
 
+impl CDCRow<'_> {
     /// Allows to get a value from the column that corresponds to the logged table.
     /// Returns `None` if the value is `null`.
     /// Panics if the column does not exist in this table.
@@ -271,6 +368,7 @@ impl CDCRow<'_> {
     /// Returns new empty vector if the value is `null` or such column doesn't exist.
     /// The returned value is always owned.
     /// Leaves `None` in place of taken data.
+    #[cfg(not(feature))]
     pub fn take_deleted_elements(&mut self, name: &str) -> Vec<CqlValue> {
         self.schema
             .deleted_el_mapping
